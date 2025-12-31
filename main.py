@@ -5,15 +5,17 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks, Query
 from pydantic import BaseModel
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, ForeignKey, Boolean, func, select, desc
-from sqlalchemy.orm import sessionmaker, Session, declarative_base, relationship
+from sqlalchemy.orm import sessionmaker, Session, declarative_base, relationship, joinedload
 
 # --- CONFIGURACIÓN BASE DE DATOS ---
 DATABASE_URL = os.getenv("DATABASE_URL")
-# Si estás probando local y no tienes env var seteadas, usa sqlite de fallback o ajusta string
+
+# Corrección automática de URL para Render (postgres -> postgresql)
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+# Fallback para pruebas locales si no hay variable de entorno
 if not DATABASE_URL:
     DATABASE_URL = "sqlite:///./local_test.db"
-elif DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -50,7 +52,7 @@ class Invoice(Base):
     __tablename__ = "facturas"
     id = Column(Integer, primary_key=True, index=True)
     numero_presupuesto = Column(String, nullable=True)
-    numero_factura = Column(String, index=True) # No unique estricto para permitir borradores o duplicados legacy
+    numero_factura = Column(String, index=True)
     fecha = Column(String)
     cliente_id = Column(Integer, ForeignKey("clientes.id"), nullable=True)
     cliente_nombre = Column(String)
@@ -66,6 +68,7 @@ class Invoice(Base):
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
+    # Relación con items (cascade para borrar items si se borra factura)
     items = relationship("InvoiceItem", back_populates="invoice", cascade="all, delete-orphan")
 
 class InvoiceItem(Base):
@@ -81,7 +84,7 @@ class InvoiceItem(Base):
 class InvoiceLock(Base):
     __tablename__ = "invoice_locks"
     invoice_id = Column(Integer, ForeignKey("facturas.id"), primary_key=True)
-    user_id = Column(Integer) # ID de usuario temporal o real
+    user_id = Column(Integer)
     acquired_at = Column(DateTime, default=datetime.datetime.utcnow)
 
 class DraftStatus(Base):
@@ -150,7 +153,6 @@ def get_db():
 # --- TAREAS EN SEGUNDO PLANO ---
 
 def cleanup_inactive_users_logic(db: Session):
-    # Limpiar locks y estados viejos (> 30 seg)
     limit = datetime.datetime.utcnow() - datetime.timedelta(seconds=30)
     db.query(InvoiceLock).filter(InvoiceLock.acquired_at < limit).delete()
     db.query(DraftStatus).filter(DraftStatus.started_at < limit).delete()
@@ -159,7 +161,6 @@ def cleanup_inactive_users_logic(db: Session):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Crear tablas al iniciar
     Base.metadata.create_all(bind=engine)
     yield
 
@@ -170,15 +171,12 @@ app = FastAPI(lifespan=lifespan, title="FacBal API")
 # 1. HEARTBEAT Y USUARIOS
 @app.post("/heartbeat")
 def heartbeat(hb: HeartbeatRequest, bg_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    # Registrar usuario "vivo"
     user = db.query(User).filter(User.id == hb.user_id).first()
     if not user:
         user = User(id=hb.user_id, full_name=f"User {hb.user_id}")
         db.add(user)
-    
     user.last_seen = datetime.datetime.utcnow()
     db.commit()
-    
     bg_tasks.add_task(cleanup_inactive_users_logic, db)
     return {"status": "ok"}
 
@@ -227,7 +225,6 @@ def get_products(db: Session = Depends(get_db)):
 
 @app.post("/products")
 def create_product(prod: ProductCreate, db: Session = Depends(get_db)):
-    # Upsert: Si existe actualiza, si no crea
     existing = db.query(Product).filter(Product.id == prod.id).first()
     if existing:
         for key, value in prod.dict().items():
@@ -256,28 +253,23 @@ def delete_product(pid: str, db: Session = Depends(get_db)):
 # 4. FACTURAS
 @app.get("/invoices")
 def get_invoices(search: Optional[str] = None, limit: int = 50, db: Session = Depends(get_db)):
+    # NOTA: Este endpoint es para listas (historial). No trae items para ser rápido.
     q = db.query(Invoice)
     if search:
         s = f"%{search}%"
         q = q.filter((Invoice.cliente_nombre.ilike(s)) | (Invoice.numero_factura.ilike(s)))
-    
     return q.order_by(desc(Invoice.id)).limit(limit).all()
 
 @app.get("/invoices/{fid}")
 def get_invoice(fid: int, db: Session = Depends(get_db)):
-    inv = db.query(Invoice).filter(Invoice.id == fid).first()
+    # --- CORRECCIÓN CRÍTICA: joinedload para traer items ---
+    inv = db.query(Invoice).options(joinedload(Invoice.items)).filter(Invoice.id == fid).first()
     if not inv: raise HTTPException(404, "Factura no encontrada")
-    # SQLAlchemy carga items automáticamente por la relación, FastAPI los serializa
     return inv
 
 @app.post("/invoices")
 def create_invoice(inv: InvoiceCreate, db: Session = Depends(get_db)):
-    # Verificar si existe numero factura
-    if inv.numero_factura:
-        exists = db.query(Invoice).filter(Invoice.numero_factura == inv.numero_factura).first()
-        # En migración permitimos duplicados o podríamos actualizar. 
-        # Aquí asumimos creación nueva estándar.
-    
+    # Crear cabecera
     db_inv = Invoice(
         numero_factura=inv.numero_factura,
         numero_presupuesto=inv.numero_presupuesto,
@@ -292,8 +284,9 @@ def create_invoice(inv: InvoiceCreate, db: Session = Depends(get_db)):
         created_by=inv.user_id
     )
     db.add(db_inv)
-    db.flush() # Para obtener ID
+    db.flush() # Genera el ID
     
+    # Crear items
     for item in inv.items:
         db_item = InvoiceItem(
             factura_id=db_inv.id,
@@ -304,7 +297,6 @@ def create_invoice(inv: InvoiceCreate, db: Session = Depends(get_db)):
         )
         db.add(db_item)
     
-    # Limpiar borrador de este usuario
     db.query(DraftStatus).filter(DraftStatus.user_id == inv.user_id).delete()
     
     db.commit()
@@ -316,7 +308,6 @@ def update_invoice(fid: int, inv: InvoiceCreate, db: Session = Depends(get_db)):
     db_inv = db.query(Invoice).filter(Invoice.id == fid).first()
     if not db_inv: raise HTTPException(404)
     
-    # Actualizar Cabecera
     db_inv.numero_factura = inv.numero_factura
     db_inv.fecha = inv.fecha
     db_inv.cliente_id = inv.cliente_id
@@ -326,7 +317,6 @@ def update_invoice(fid: int, inv: InvoiceCreate, db: Session = Depends(get_db)):
     db_inv.total = inv.total
     db_inv.envio = inv.envio
     
-    # Reemplazar Items (Estrategia simple: borrar y crear)
     db.query(InvoiceItem).filter(InvoiceItem.factura_id == fid).delete()
     for item in inv.items:
         db_item = InvoiceItem(
@@ -349,7 +339,6 @@ def delete_invoice(fid: int, db: Session = Depends(get_db)):
 
 @app.get("/invoices/next_number")
 def next_number(prefix: str = "F", db: Session = Depends(get_db)):
-    # Lógica simple: buscar el último creado
     last = db.query(Invoice).filter(Invoice.numero_factura.like(f"{prefix}-%")).order_by(desc(Invoice.id)).first()
     if last:
         try:
@@ -358,7 +347,7 @@ def next_number(prefix: str = "F", db: Session = Depends(get_db)):
         except: pass
     return {"next_number": f"{prefix}-00001"}
 
-# 5. LOCKS & DRAFTS (TIEMPO REAL)
+# 5. LOCKS & DRAFTS
 @app.post("/invoices/{fid}/lock")
 def acquire_lock(fid: int, req: LockRequest, db: Session = Depends(get_db)):
     existing = db.query(InvoiceLock).filter(InvoiceLock.invoice_id == fid).first()
@@ -385,5 +374,4 @@ def register_draft(req: DraftRequest, db: Session = Depends(get_db)):
 @app.get("/invoices/drafts")
 def get_drafts(db: Session = Depends(get_db)):
     drafts = db.query(DraftStatus).all()
-    # En un sistema real haríamos join con Users para el nombre, aquí simulamos o usamos ID
     return [{"user": f"User {d.user_id}", "client": d.client_name, "user_id": d.user_id} for d in drafts]
