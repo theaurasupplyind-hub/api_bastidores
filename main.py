@@ -156,7 +156,7 @@ def cleanup_inactive_users_logic(db: Session):
     limit = datetime.datetime.utcnow() - datetime.timedelta(seconds=30)
     db.query(InvoiceLock).filter(InvoiceLock.acquired_at < limit).delete()
     db.query(DraftStatus).filter(DraftStatus.started_at < limit).delete()
-    db.query(User).filter(User.last_seen < limit).delete()
+    #db.query(User).filter(User.last_seen < limit).delete()
     db.commit()
 
 @asynccontextmanager
