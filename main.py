@@ -185,6 +185,11 @@ def heartbeat(hb: HeartbeatRequest, bg_tasks: BackgroundTasks, db: Session = Dep
     db.commit()
     bg_tasks.add_task(cleanup_inactive_users_logic, db)
     return {"status": "ok"}
+# 1. AGREGAR este nuevo endpoint (puede ir junto a los otros de usuarios)
+@app.get("/users")
+def get_all_users(db: Session = Depends(get_db)):
+    # Devuelve todos los usuarios registrados
+    return db.query(User).order_by(User.full_name).all()
 
 @app.get("/users/active")
 def get_active_users(db: Session = Depends(get_db)):
@@ -258,12 +263,17 @@ def delete_product(pid: str, db: Session = Depends(get_db)):
 
 # 4. FACTURAS
 @app.get("/invoices")
-def get_invoices(search: Optional[str] = None, limit: int = 50, db: Session = Depends(get_db)):
-    # NOTA: Este endpoint es para listas (historial). No trae items para ser rápido.
+def get_invoices(search: Optional[str] = None, user_id: Optional[int] = None, limit: int = 50, db: Session = Depends(get_db)):
     q = db.query(Invoice)
+    
+    # Nuevo filtro: Si mandan user_id, filtramos por creador
+    if user_id:
+        q = q.filter(Invoice.created_by == user_id)
+        
     if search:
         s = f"%{search}%"
         q = q.filter((Invoice.cliente_nombre.ilike(s)) | (Invoice.numero_factura.ilike(s)))
+    
     return q.order_by(desc(Invoice.id)).limit(limit).all()
 
 @app.get("/invoices/{fid}")
