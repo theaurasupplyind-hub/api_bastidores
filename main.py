@@ -339,13 +339,25 @@ def delete_invoice(fid: int, db: Session = Depends(get_db)):
 
 @app.get("/invoices/next_number")
 def next_number(prefix: str = "F", db: Session = Depends(get_db)):
-    last = db.query(Invoice).filter(Invoice.numero_factura.like(f"{prefix}-%")).order_by(desc(Invoice.id)).first()
-    if last:
+    # Traemos las últimas 50 facturas para encontrar el número más alto válido
+    # (Esto evita errores si la última factura tiene un formato raro como "A-TEST")
+    candidates = db.query(Invoice).filter(Invoice.numero_factura.like(f"{prefix}-%")).order_by(desc(Invoice.id)).limit(50).all()
+    
+    max_num = 0
+    for inv in candidates:
         try:
-            num = int(last.numero_factura.split("-")[1])
-            return {"next_number": f"{prefix}-{str(num+1).zfill(5)}"}
-        except: pass
-    return {"next_number": f"{prefix}-00001"}
+            # Intentamos separar "F" de "00023"
+            parts = inv.numero_factura.split("-")
+            # Verificamos que la segunda parte sea un número
+            if len(parts) >= 2 and parts[1].isdigit():
+                num = int(parts[1])
+                if num > max_num:
+                    max_num = num
+        except:
+            continue # Si falla una, seguimos con la siguiente
+
+    # Retornamos el máximo encontrado + 1
+    return {"next_number": f"{prefix}-{str(max_num+1).zfill(5)}"}
 
 # 5. LOCKS & DRAFTS
 @app.post("/invoices/{fid}/lock")
