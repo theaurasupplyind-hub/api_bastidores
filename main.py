@@ -97,6 +97,7 @@ class DraftStatus(Base):
 
 class HeartbeatRequest(BaseModel):
     user_id: int
+    username: Optional[str] = "Desconocido" # Nuevo campo
 
 class LockRequest(BaseModel):
     user_id: int
@@ -173,9 +174,14 @@ app = FastAPI(lifespan=lifespan, title="FacBal API")
 def heartbeat(hb: HeartbeatRequest, bg_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.id == hb.user_id).first()
     if not user:
-        user = User(id=hb.user_id, full_name=f"User {hb.user_id}")
+        # Si no existe, lo creamos con el nombre que viene
+        user = User(id=hb.user_id, full_name=hb.username)
         db.add(user)
-    user.last_seen = datetime.datetime.utcnow()
+    else:
+        # Si existe, actualizamos el nombre (por si cambió) y la hora
+        user.full_name = hb.username
+        user.last_seen = datetime.datetime.utcnow()
+    
     db.commit()
     bg_tasks.add_task(cleanup_inactive_users_logic, db)
     return {"status": "ok"}
