@@ -275,10 +275,48 @@ def get_invoices(search: Optional[str] = None, user_id: Optional[int] = None, li
         q = q.filter((Invoice.cliente_nombre.ilike(s)) | (Invoice.numero_factura.ilike(s)))
     
     return q.order_by(desc(Invoice.id)).limit(limit).all()
+# 1. PRIMERO: Las rutas específicas (como drafts o next_number)
+@app.post("/invoices/draft")
+def register_draft(req: DraftRequest, db: Session = Depends(get_db)):
+    draft = db.query(DraftStatus).filter(DraftStatus.user_id == req.user_id).first()
+    if not draft:
+        draft = DraftStatus(user_id=req.user_id)
+        db.add(draft)
+    draft.client_name = req.client_name
+    draft.started_at = datetime.datetime.utcnow()
+    db.commit()
+    return {"status": "ok"}
 
+@app.get("/invoices/drafts")
+def get_drafts(db: Session = Depends(get_db)):
+    drafts = db.query(DraftStatus).all()
+    return [{"user": f"User {d.user_id}", "client": d.client_name, "user_id": d.user_id} for d in drafts]
+
+@app.get("/invoices/next_number")
+def next_number(prefix: str = "F", db: Session = Depends(get_db)):
+    last = db.query(Invoice).filter(Invoice.numero_factura.like(f"{prefix}-%")).order_by(desc(Invoice.id)).first()
+    if last:
+        try:
+            num = int(last.numero_factura.split("-")[1])
+            return {"next_number": f"{prefix}-{str(num+1).zfill(5)}"}
+        except: pass
+    return {"next_number": f"{prefix}-00001"}
+
+@app.post("/invoices/{fid}/lock")
+def acquire_lock(fid: int, req: LockRequest, db: Session = Depends(get_db)):
+    existing = db.query(InvoiceLock).filter(InvoiceLock.invoice_id == fid).first()
+    if existing:
+        if existing.user_id != req.user_id:
+            raise HTTPException(409, "Factura bloqueada por otro usuario")
+        existing.acquired_at = datetime.datetime.utcnow()
+    else:
+        db.add(InvoiceLock(invoice_id=fid, user_id=req.user_id))
+    db.commit()
+    return {"status": "locked"}
+
+# 2. AL FINAL: La ruta genérica {fid} (que atrapa todo lo que sea un número)
 @app.get("/invoices/{fid}")
 def get_invoice(fid: int, db: Session = Depends(get_db)):
-    # --- CORRECCIÓN CRÍTICA: joinedload para traer items ---
     inv = db.query(Invoice).options(joinedload(Invoice.items)).filter(Invoice.id == fid).first()
     if not inv: raise HTTPException(404, "Factura no encontrada")
     return inv
@@ -388,18 +426,4 @@ def acquire_lock(fid: int, req: LockRequest, db: Session = Depends(get_db)):
     db.commit()
     return {"status": "locked"}
 
-@app.post("/invoices/draft")
-def register_draft(req: DraftRequest, db: Session = Depends(get_db)):
-    draft = db.query(DraftStatus).filter(DraftStatus.user_id == req.user_id).first()
-    if not draft:
-        draft = DraftStatus(user_id=req.user_id)
-        db.add(draft)
-    draft.client_name = req.client_name
-    draft.started_at = datetime.datetime.utcnow()
-    db.commit()
-    return {"status": "ok"}
 
-@app.get("/invoices/drafts")
-def get_drafts(db: Session = Depends(get_db)):
-    drafts = db.query(DraftStatus).all()
-    return [{"user": f"User {d.user_id}", "client": d.client_name, "user_id": d.user_id} for d in drafts]
