@@ -276,6 +276,7 @@ def delete_product(pid: str, db: Session = Depends(get_db)):
     db.commit()
     return {"status": "deleted"}
 
+
 # INVOICES
 @app.get("/invoices")
 def get_invoices(search: Optional[str] = None, user_id: Optional[int] = None, limit: int = 50, db: Session = Depends(get_db)):
@@ -291,6 +292,20 @@ def get_drafts(db: Session = Depends(get_db)):
     drafts = db.query(DraftStatus).all()
     return [{"user": f"User {d.user_id}", "client": d.client_name, "user_id": d.user_id} for d in drafts]
 
+@app.get("/invoices/next_number")
+def next_number(prefix: str = "F", db: Session = Depends(get_db)):
+    # Buscar el número más alto existente
+    candidates = db.query(Invoice).filter(Invoice.numero_factura.like(f"{prefix}-%")).order_by(desc(Invoice.id)).limit(50).all()
+    max_num = 0
+    for inv in candidates:
+        try:
+            parts = inv.numero_factura.split("-")
+            if len(parts) >= 2 and parts[1].isdigit():
+                num = int(parts[1])
+                if num > max_num: max_num = num
+        except: continue
+    return {"next_number": f"{prefix}-{str(max_num+1).zfill(5)}"}
+
 @app.post("/invoices/draft")
 def register_draft(req: DraftRequest, db: Session = Depends(get_db)):
     draft = db.query(DraftStatus).filter(DraftStatus.user_id == req.user_id).first()
@@ -301,6 +316,7 @@ def register_draft(req: DraftRequest, db: Session = Depends(get_db)):
     draft.started_at = datetime.datetime.utcnow()
     db.commit()
     return {"status": "ok"}
+
 
 @app.post("/invoices/{fid}/lock")
 def acquire_lock(fid: int, req: LockRequest, db: Session = Depends(get_db)):
@@ -381,20 +397,6 @@ def delete_invoice(fid: int, db: Session = Depends(get_db)):
         db.delete(inv)
         db.commit()
     return {"status": "deleted"}
-
-@app.get("/invoices/next_number")
-def next_number(prefix: str = "F", db: Session = Depends(get_db)):
-    # Buscar el número más alto existente
-    candidates = db.query(Invoice).filter(Invoice.numero_factura.like(f"{prefix}-%")).order_by(desc(Invoice.id)).limit(50).all()
-    max_num = 0
-    for inv in candidates:
-        try:
-            parts = inv.numero_factura.split("-")
-            if len(parts) >= 2 and parts[1].isdigit():
-                num = int(parts[1])
-                if num > max_num: max_num = num
-        except: continue
-    return {"next_number": f"{prefix}-{str(max_num+1).zfill(5)}"}
 
 # PAGOS
 @app.post("/payments")
