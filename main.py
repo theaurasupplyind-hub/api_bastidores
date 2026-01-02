@@ -4,17 +4,17 @@ from typing import List, Optional
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks, Query
 from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, ForeignKey, Boolean, func, select, desc
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, ForeignKey, text, desc
 from sqlalchemy.orm import sessionmaker, Session, declarative_base, relationship, joinedload
 
 # --- CONFIGURACIÓN BASE DE DATOS ---
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Corrección automática de URL para Render (postgres -> postgresql)
+# Corrección automática de URL para Render
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-# Fallback para pruebas locales
+# Fallback local
 if not DATABASE_URL:
     DATABASE_URL = "sqlite:///./local_test.db"
 
@@ -22,7 +22,7 @@ engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# --- MODELOS SQLALCHEMY (TABLAS) ---
+# --- MODELOS SQLALCHEMY ---
 
 class User(Base):
     __tablename__ = "users"
@@ -41,7 +41,7 @@ class Client(Base):
 
 class Product(Base):
     __tablename__ = "productos"
-    id = Column(String, primary_key=True) # ID Manual ej: MAN_123
+    id = Column(String, primary_key=True)
     descripcion = Column(String, nullable=False)
     precio_unitario = Column(Float, nullable=False)
     categoria = Column(String, default="Varios")
@@ -63,15 +63,13 @@ class Invoice(Base):
     envio = Column(Float, default=0)
     tipo = Column(String, default='PRESUPUESTO')
     
-    # Estados de producción
+    # NUEVAS COLUMNAS (Se agregarán automágicamente si faltan)
     estado_orden_tela = Column(String, default='PENDING')
     estado_moldura = Column(String, default='PENDING')
     
-    # Auditoría
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
-    # Relación con items (cascade para borrar items si se borra factura)
     items = relationship("InvoiceItem", back_populates="invoice", cascade="all, delete-orphan")
 
 class InvoiceItem(Base):
@@ -84,11 +82,11 @@ class InvoiceItem(Base):
     total = Column(Float)
     invoice = relationship("Invoice", back_populates="items")
 
-# --- NUEVO: TABLA DE PAGOS ---
+# NUEVA TABLA PAGOS
 class Payment(Base):
     __tablename__ = "pagos"
     id = Column(Integer, primary_key=True, index=True)
-    invoice_id = Column(Integer, ForeignKey("facturas.id")) # Relación lógica
+    invoice_id = Column(Integer, ForeignKey("facturas.id"))
     amount = Column(Float)
     date = Column(String)
     method = Column(String)
@@ -106,7 +104,7 @@ class DraftStatus(Base):
     client_name = Column(String)
     started_at = Column(DateTime, default=datetime.datetime.utcnow)
 
-# --- ESQUEMAS PYDANTIC (VALIDACIÓN DATOS) ---
+# --- ESQUEMAS PYDANTIC ---
 
 class HeartbeatRequest(BaseModel):
     user_id: int
@@ -155,45 +153,59 @@ class InvoiceCreate(BaseModel):
     tipo: str = "PRESUPUESTO"
     user_id: int
 
-# Schema para actualización parcial (PATCH)
 class InvoicePatch(BaseModel):
     estado_moldura: Optional[str] = None
     estado_orden_tela: Optional[str] = None
 
-# Schema para Pagos
 class PaymentCreate(BaseModel):
     invoice_id: int
     amount: float
     date: str
     method: str
 
-# --- DEPENDENCIAS ---
+# --- MIGRACIÓN AUTOMÁTICA DE DB ---
+def run_db_migrations():
+    """Ejecuta SQL crudo para asegurar que las columnas existan"""
+    with engine.connect() as conn:
+        try:
+            # 1. Agregar columnas a Facturas si no existen
+            conn.execute(text("ALTER TABLE facturas ADD COLUMN IF NOT EXISTS estado_moldura VARCHAR DEFAULT 'PENDING';"))
+            conn.execute(text("ALTER TABLE facturas ADD COLUMN IF NOT EXISTS estado_orden_tela VARCHAR DEFAULT 'PENDING';"))
+            
+            # 2. Crear tabla Pagos si no existe (SQLite vs Postgres)
+            # SQLAlchemy 'create_all' lo hace, pero forzamos el commit aquí por seguridad
+            conn.commit()
+            print("--- Migraciones de DB ejecutadas correctamente ---")
+        except Exception as e:
+            print(f"--- Nota sobre Migraciones: {e} ---")
 
+# --- LIFESPAN (STARTUP) ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 1. Crear tablas base que no existan
+    Base.metadata.create_all(bind=engine)
+    # 2. Correr parches de columnas
+    run_db_migrations()
+    yield
+
+app = FastAPI(lifespan=lifespan, title="FacBal API")
+
+# --- DEPENDENCIAS ---
 def get_db():
     db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+    try: yield db
+    finally: db.close()
 
-# --- TAREAS EN SEGUNDO PLANO ---
-
+# --- BACKGROUND TASKS ---
 def cleanup_inactive_users_logic(db: Session):
     limit = datetime.datetime.utcnow() - datetime.timedelta(seconds=30)
     db.query(InvoiceLock).filter(InvoiceLock.acquired_at < limit).delete()
     db.query(DraftStatus).filter(DraftStatus.started_at < limit).delete()
     db.commit()
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    Base.metadata.create_all(bind=engine)
-    yield
+# ================= ENDPOINTS =================
 
-# --- APP ---
-
-app = FastAPI(lifespan=lifespan, title="FacBal API")
-
-# 1. HEARTBEAT Y USUARIOS
+# 1. HEARTBEAT & USERS
 @app.post("/heartbeat")
 def heartbeat(hb: HeartbeatRequest, bg_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.id == hb.user_id).first()
@@ -245,11 +257,17 @@ def update_client(cid: int, client: ClientCreate, db: Session = Depends(get_db))
 
 @app.delete("/clients/{cid}")
 def delete_client(cid: int, db: Session = Depends(get_db)):
-    # Intentar borrar. Si falla por FK, SQL Alchemy lanzará error y FastAPI retornará 500
-    db_c = db.query(Client).filter(Client.id == cid).first()
-    if db_c:
-        db.delete(db_c)
-        db.commit()
+    # 1. Buscar facturas asociadas a este cliente
+    invoices = db.query(Invoice).filter(Invoice.cliente_id == cid).all()
+    
+    # 2. Desvincularlas (NO borrarlas): Poner cliente_id en NULL
+    for inv in invoices:
+        inv.cliente_id = None
+    
+    # 3. Ahora sí, borrar el cliente
+    db.query(Client).filter(Client.id == cid).delete()
+    db.commit()
+    
     return {"status": "deleted"}
 
 # 3. PRODUCTOS
@@ -288,8 +306,7 @@ def delete_product(pid: str, db: Session = Depends(get_db)):
 @app.get("/invoices")
 def get_invoices(search: Optional[str] = None, user_id: Optional[int] = None, limit: int = 50, db: Session = Depends(get_db)):
     q = db.query(Invoice)
-    if user_id:
-        q = q.filter(Invoice.created_by == user_id)
+    if user_id: q = q.filter(Invoice.created_by == user_id)
     if search:
         s = f"%{search}%"
         q = q.filter((Invoice.cliente_nombre.ilike(s)) | (Invoice.numero_factura.ilike(s)))
@@ -332,30 +349,19 @@ def get_invoice(fid: int, db: Session = Depends(get_db)):
 @app.post("/invoices")
 def create_invoice(inv: InvoiceCreate, db: Session = Depends(get_db)):
     db_inv = Invoice(
-        numero_factura=inv.numero_factura,
-        numero_presupuesto=inv.numero_presupuesto,
-        fecha=inv.fecha,
-        cliente_id=inv.cliente_id,
-        cliente_nombre=inv.cliente_nombre,
-        cliente_domicilio=inv.cliente_domicilio,
-        cliente_telefono=inv.cliente_telefono,
-        total=inv.total,
-        envio=inv.envio,
-        tipo=inv.tipo,
-        created_by=inv.user_id
+        numero_factura=inv.numero_factura, numero_presupuesto=inv.numero_presupuesto,
+        fecha=inv.fecha, cliente_id=inv.cliente_id, cliente_nombre=inv.cliente_nombre,
+        cliente_domicilio=inv.cliente_domicilio, cliente_telefono=inv.cliente_telefono,
+        total=inv.total, envio=inv.envio, tipo=inv.tipo, created_by=inv.user_id
     )
     db.add(db_inv)
     db.flush()
     
     for item in inv.items:
-        db_item = InvoiceItem(
-            factura_id=db_inv.id,
-            cantidad=item.cantidad,
-            descripcion=item.descripcion,
-            precio_unitario=item.precio_unitario,
-            total=item.total
-        )
-        db.add(db_item)
+        db.add(InvoiceItem(
+            factura_id=db_inv.id, cantidad=item.cantidad, descripcion=item.descripcion,
+            precio_unitario=item.precio_unitario, total=item.total
+        ))
     
     db.query(DraftStatus).filter(DraftStatus.user_id == inv.user_id).delete()
     db.commit()
@@ -376,22 +382,16 @@ def update_invoice(fid: int, inv: InvoiceCreate, db: Session = Depends(get_db)):
     db_inv.total = inv.total
     db_inv.envio = inv.envio
     
-    # Reemplazo total de items
     db.query(InvoiceItem).filter(InvoiceItem.factura_id == fid).delete()
     for item in inv.items:
-        db_item = InvoiceItem(
-            factura_id=fid,
-            cantidad=item.cantidad,
-            descripcion=item.descripcion,
-            precio_unitario=item.precio_unitario,
-            total=item.total
-        )
-        db.add(db_item)
-        
+        db.add(InvoiceItem(
+            factura_id=fid, cantidad=item.cantidad, descripcion=item.descripcion,
+            precio_unitario=item.precio_unitario, total=item.total
+        ))
     db.commit()
     return {"status": "updated"}
 
-# --- NUEVO: ENDPOINT PATCH (Para Molduras/Telas) ---
+# --- ENDPOINT PATCH PARA MOLDURAS/TELAS ---
 @app.patch("/invoices/{fid}")
 def patch_invoice(fid: int, patch: InvoicePatch, db: Session = Depends(get_db)):
     db_inv = db.query(Invoice).filter(Invoice.id == fid).first()
@@ -407,9 +407,11 @@ def patch_invoice(fid: int, patch: InvoicePatch, db: Session = Depends(get_db)):
 
 @app.delete("/invoices/{fid}")
 def delete_invoice(fid: int, db: Session = Depends(get_db)):
-    # CORRECCIÓN: Borrar usando el objeto ORM permite que funcione el cascade="all, delete-orphan"
     inv = db.query(Invoice).filter(Invoice.id == fid).first()
     if inv:
+        # Al borrar la factura, SQLAlchemy borra automáticamente sus items
+        # gracias a cascade="all, delete-orphan" en el modelo.
+        # NO borra al cliente.
         db.delete(inv)
         db.commit()
     return {"status": "deleted"}
@@ -427,16 +429,10 @@ def next_number(prefix: str = "F", db: Session = Depends(get_db)):
         except: continue
     return {"next_number": f"{prefix}-{str(max_num+1).zfill(5)}"}
 
-# --- NUEVO: ENDPOINTS DE PAGOS ---
-
+# 5. PAGOS
 @app.post("/payments")
 def create_payment(pay: PaymentCreate, db: Session = Depends(get_db)):
-    db_pay = Payment(
-        invoice_id=pay.invoice_id,
-        amount=pay.amount,
-        date=pay.date,
-        method=pay.method
-    )
+    db_pay = Payment(invoice_id=pay.invoice_id, amount=pay.amount, date=pay.date, method=pay.method)
     db.add(db_pay)
     db.commit()
     return {"status": "ok", "id": db_pay.id}
