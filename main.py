@@ -6,6 +6,7 @@ from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks, Qu
 from pydantic import BaseModel
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, ForeignKey, text, desc
 from sqlalchemy.orm import sessionmaker, Session, declarative_base, relationship, joinedload
+from sqlalchemy.exc import IntegrityError  # <--- AGREGAR ESTO
 
 # --- CONFIGURACIÓN BASE DE DATOS ---
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -18,6 +19,10 @@ engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
+class DocumentSequence(Base):
+    __tablename__ = "document_sequences"
+    prefix = Column(String, primary_key=True)  # Ejemplo: 'F'
+    last_val = Column(Integer, default=0)
 # --- MODELOS ---
 class User(Base):
     __tablename__ = "users"
@@ -154,6 +159,28 @@ class PaymentCreate(BaseModel):
     date: str
     method: str
 
+def get_next_atomic_number(db: Session, prefix="F") -> str:
+    """Genera el siguiente número bloqueando la fila para evitar duplicados"""
+    # Intentamos bloquear la fila
+    seq = db.query(DocumentSequence).filter_by(prefix=prefix).with_for_update().first()
+    
+    if not seq:
+        try:
+            # Si no existe la secuencia, la creamos
+            seq = DocumentSequence(prefix=prefix, last_val=0)
+            db.add(seq)
+            db.commit() # Guardamos para crear la fila
+            # Volvemos a pedirla con bloqueo
+            seq = db.query(DocumentSequence).filter_by(prefix=prefix).with_for_update().first()
+        except IntegrityError:
+            db.rollback()
+            return get_next_atomic_number(db, prefix)
+            
+    # Incrementamos el valor
+    seq.last_val += 1
+    db.add(seq)
+    # NO hacemos commit aquí, el commit se hace al guardar la factura completa
+    return f"{prefix}-{str(seq.last_val).zfill(5)}"
 # --- STARTUP ---
 def run_db_migrations():
     with engine.connect() as conn:
@@ -181,6 +208,15 @@ def cleanup_inactive_users_logic(db: Session):
     db.commit()
 
 app = FastAPI(lifespan=lifespan, title="FacBal API")
+
+@app.get("/sync/status")
+def get_sync_status(db: Session = Depends(get_db)):
+    """Devuelve el ID de la última factura para saber si refrescar"""
+    last_inv = db.query(Invoice).order_by(desc(Invoice.id)).first()
+    return {
+        "last_invoice_id": last_inv.id if last_inv else 0,
+        "server_time": datetime.datetime.utcnow().timestamp()
+    }
 
 # --- ENDPOINTS ---
 
@@ -338,20 +374,41 @@ def get_invoice(fid: int, db: Session = Depends(get_db)):
 
 @app.post("/invoices")
 def create_invoice(inv: InvoiceCreate, db: Session = Depends(get_db)):
+    # 1. GENERAR NÚMERO ATÓMICO (Aquí está la magia)
+    prefix = "F" 
+    final_number = get_next_atomic_number(db, prefix)
+
+    # 2. Crear la factura usando 'final_number' en vez de 'inv.numero_factura'
     db_inv = Invoice(
-        numero_factura=inv.numero_factura, numero_presupuesto=inv.numero_presupuesto,
-        fecha=inv.fecha, cliente_id=inv.cliente_id, cliente_nombre=inv.cliente_nombre,
-        cliente_domicilio=inv.cliente_domicilio, cliente_telefono=inv.cliente_telefono,
-        total=inv.total, envio=inv.envio, tipo=inv.tipo, created_by=inv.user_id
+        numero_factura=final_number,  # <--- USAMOS EL GENERADO POR EL SERVIDOR
+        numero_presupuesto=inv.numero_presupuesto,
+        fecha=inv.fecha, 
+        cliente_id=inv.cliente_id, 
+        cliente_nombre=inv.cliente_nombre,
+        cliente_domicilio=inv.cliente_domicilio, 
+        cliente_telefono=inv.cliente_telefono,
+        total=inv.total, 
+        envio=inv.envio, 
+        tipo=inv.tipo, 
+        created_by=inv.user_id
     )
     db.add(db_inv)
-    db.flush()
+    db.flush() # Genera el ID de la factura
+
+    # 3. Agregar los items
     for item in inv.items:
         db.add(InvoiceItem(
-            factura_id=db_inv.id, cantidad=item.cantidad, descripcion=item.descripcion,
-            precio_unitario=item.precio_unitario, total=item.total
+            factura_id=db_inv.id, 
+            cantidad=item.cantidad, 
+            descripcion=item.descripcion,
+            precio_unitario=item.precio_unitario, 
+            total=item.total
         ))
+    
+    # 4. Limpiar borrador si existe
     db.query(DraftStatus).filter(DraftStatus.user_id == inv.user_id).delete()
+    
+    # 5. COMMIT FINAL (Guarda la factura y el nuevo número de secuencia juntos)
     db.commit()
     db.refresh(db_inv)
     return db_inv
