@@ -160,26 +160,31 @@ class PaymentCreate(BaseModel):
     method: str
 
 def get_next_atomic_number(db: Session, prefix="F") -> str:
-    """Genera el siguiente número bloqueando la fila para evitar duplicados"""
-    # Intentamos bloquear la fila
+    """Genera el siguiente número bloqueando la fila. Inicia en 10000 si es menor."""
+    INITIAL_OFFSET = 9999  # <--- CONFIGURACIÓN DEL SALTO
+
+    # Bloquear fila para atomicidad
     seq = db.query(DocumentSequence).filter_by(prefix=prefix).with_for_update().first()
     
     if not seq:
         try:
-            # Si no existe la secuencia, la creamos
-            seq = DocumentSequence(prefix=prefix, last_val=0)
+            # Si no existe secuencia, crearla lista para saltar al 10000
+            seq = DocumentSequence(prefix=prefix, last_val=INITIAL_OFFSET)
             db.add(seq)
-            db.commit() # Guardamos para crear la fila
-            # Volvemos a pedirla con bloqueo
+            db.commit()
             seq = db.query(DocumentSequence).filter_by(prefix=prefix).with_for_update().first()
         except IntegrityError:
             db.rollback()
             return get_next_atomic_number(db, prefix)
             
-    # Incrementamos el valor
+    # Si la secuencia existe pero es menor a 9999 (ej: 0, 5, 100), forzar salto
+    if seq.last_val < INITIAL_OFFSET:
+        seq.last_val = INITIAL_OFFSET
+
+    # Incrementar (9999 -> 10000)
     seq.last_val += 1
     db.add(seq)
-    # NO hacemos commit aquí, el commit se hace al guardar la factura completa
+    # El commit se hace junto con la factura en create_invoice
     return f"{prefix}-{str(seq.last_val).zfill(5)}"
 # --- STARTUP ---
 def run_db_migrations():
@@ -340,6 +345,10 @@ def next_number(prefix: str = "F", db: Session = Depends(get_db)):
                 num = int(parts[1])
                 if num > max_num: max_num = num
         except: continue
+         # --- AGREGAR ESTAS 3 LÍNEAS ---
+    if max_num < 9999:
+        max_num = 9999
+    # ------------------------------
     return {"next_number": f"{prefix}-{str(max_num+1).zfill(5)}"}
 
 @app.post("/invoices/draft")
