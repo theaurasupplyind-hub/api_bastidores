@@ -475,3 +475,22 @@ def create_payment(pay: PaymentCreate, db: Session = Depends(get_db)):
 @app.get("/payments")
 def get_payments(db: Session = Depends(get_db)):
     return db.query(Payment).order_by(desc(Payment.id)).limit(500).all()
+@app.put("/payments/{pid}")
+def update_payment(pid: int, pay: PaymentCreate, db: Session = Depends(get_db)):
+    db_pay = db.query(Payment).filter(Payment.id == pid).first()
+    if not db_pay: raise HTTPException(404, "Pago no encontrado")
+    
+    db_pay.amount = pay.amount
+    db_pay.date = pay.date
+    db_pay.method = pay.method
+    db.commit()
+    return {"status": "updated"}
+
+@app.delete("/payments/{pid}")
+def delete_payment(pid: int, db: Session = Depends(get_db)):
+    db_pay = db.query(Payment).filter(Payment.id == pid).first()
+    if not db_pay: raise HTTPException(404, "Pago no encontrado")
+    
+    db.delete(db_pay)
+    db.commit()
+    return {"status": "deleted"}
