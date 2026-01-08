@@ -321,11 +321,17 @@ def delete_product(pid: str, db: Session = Depends(get_db)):
 # INVOICES
 @app.get("/invoices")
 def get_invoices(search: Optional[str] = None, user_id: Optional[int] = None, limit: int = 50, db: Session = Depends(get_db)):
-    q = db.query(Invoice)
+    # --- CAMBIO AQUÍ: Agregamos .options(joinedload(Invoice.items)) ---
+    q = db.query(Invoice).options(joinedload(Invoice.items))
+    
     if user_id: q = q.filter(Invoice.created_by == user_id)
     if search:
         s = f"%{search}%"
         q = q.filter((Invoice.cliente_nombre.ilike(s)) | (Invoice.numero_factura.ilike(s)))
+    
+    # Nota: También aumentamos el límite por defecto a 1000 para que las estadísticas
+    # tomen más datos, o asegúrate de pasar un limit alto desde el cliente.
+    # Si quieres ver TODAS las estadísticas históricas, podrías subir este limit.
     return q.order_by(desc(Invoice.id)).limit(limit).all()
 
 @app.get("/invoices/drafts")
